@@ -1,5 +1,6 @@
 playwright==1.41.0
 beautifulsoup4
-gspread
-google-auth
-streamlit
+streamlit>=1.32.0
+gspread>=6.0.0
+google-auth>=2.0.0
+pandas>=2.0.0
