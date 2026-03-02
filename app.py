@@ -1,477 +1,523 @@
+"""
+MAPlanning Retail Lead Dashboard — Streamlit App
+=================================================
+Reads live from Google Sheets. Mark filters, sorts, and
+adds comments. Nothing is scraped here — just display.
+
+SETUP:
+  pip install streamlit gspread google-auth pandas
+  streamlit run app.py
+"""
+
 import streamlit as st
-import asyncio
-import re
-import time
-from datetime import datetime
-from bs4 import BeautifulSoup
-from playwright.async_api import async_playwright
+import pandas as pd
 import gspread
 from google.oauth2.service_account import Credentials
+from datetime import datetime, timedelta
+import json, re
 
-# ════════════════════════════════════════════════════════════
-# PAGE CONFIG
-# ════════════════════════════════════════════════════════════
+# ── PAGE CONFIG ─────────────────────────────────────────────
 st.set_page_config(
-    page_title="MAPlanning Lead Engine",
+    page_title="MAPlanning Lead Tracker",
     page_icon="🏗️",
-    layout="wide"
+    layout="wide",
+    initial_sidebar_state="expanded",
 )
 
-# ════════════════════════════════════════════════════════════
-# COUNCILS — add more as you build scrapers for them
-# ════════════════════════════════════════════════════════════
-COUNCILS = {
-    "Manchester": "https://pa.manchester.gov.uk/online-applications",
-    # "Leeds":      "https://publicaccess.leeds.gov.uk/online-applications",
-    # "Bristol":    "https://planningonline.bristol.gov.uk/online-applications",
-    # Add more here as you build their scrapers
-}
+# ── STYLING ──────────────────────────────────────────────────
+st.markdown("""
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=DM+Sans:wght@300;400;500;600&display=swap');
 
-# ════════════════════════════════════════════════════════════
-# FILTERS
-# ════════════════════════════════════════════════════════════
-EXCLUDE = [
-    "conservatory","porch","rear extension","loft conversion",
-    "replacement window","solar panel","fence","fencing",
-    "signage","advertisement","tree preservation","tree works",
-    "garage alteration","internal alteration","lawful development",
-    "single storey rear","garden shed","satellite dish",
-    "dropped kerb","bin store","bicycle store","prior approval",
-    "permitted development","tpo","ev charger","householder",
-    "listed building consent","discharge of condition",
-    "non-material amendment","s73","section 73",
-    "ancillary storage","outbuilding","storage building",
+  html, body, [class*="css"] {
+    font-family: 'DM Sans', sans-serif;
+  }
+
+  /* Dark sidebar */
+  section[data-testid="stSidebar"] {
+    background: #0f1117;
+    border-right: 1px solid #1e2130;
+  }
+  section[data-testid="stSidebar"] * {
+    color: #c9d1d9 !important;
+  }
+  section[data-testid="stSidebar"] .stSelectbox label,
+  section[data-testid="stSidebar"] .stMultiSelect label,
+  section[data-testid="stSidebar"] .stSlider label,
+  section[data-testid="stSidebar"] .stDateInput label {
+    color: #8b949e !important;
+    font-size: 0.75rem !important;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+  }
+
+  /* Main background */
+  .main .block-container {
+    background: #0d1117;
+    padding-top: 1.5rem;
+  }
+
+  /* Metric cards */
+  [data-testid="metric-container"] {
+    background: #161b22;
+    border: 1px solid #21262d;
+    border-radius: 10px;
+    padding: 1rem 1.25rem;
+  }
+  [data-testid="metric-container"] label {
+    color: #8b949e !important;
+    font-size: 0.72rem !important;
+    text-transform: uppercase;
+    letter-spacing: 0.1em;
+  }
+  [data-testid="metric-container"] [data-testid="stMetricValue"] {
+    font-family: 'DM Mono', monospace;
+    font-size: 2rem !important;
+    color: #f0f6fc !important;
+  }
+  [data-testid="metric-container"] [data-testid="stMetricDelta"] {
+    font-size: 0.8rem !important;
+  }
+
+  /* Score badge */
+  .score-badge {
+    display: inline-block;
+    font-family: 'DM Mono', monospace;
+    font-size: 0.8rem;
+    font-weight: 500;
+    padding: 2px 8px;
+    border-radius: 20px;
+    min-width: 40px;
+    text-align: center;
+  }
+  .score-high   { background: #1f4a2e; color: #3fb950; border: 1px solid #2ea043; }
+  .score-mid    { background: #3d2800; color: #e3b341; border: 1px solid #9e6a03; }
+  .score-low    { background: #2d1317; color: #f85149; border: 1px solid #b22222; }
+
+  /* Lead cards */
+  .lead-card {
+    background: #161b22;
+    border: 1px solid #21262d;
+    border-radius: 12px;
+    padding: 1.25rem 1.5rem;
+    margin-bottom: 1rem;
+    transition: border-color 0.15s;
+  }
+  .lead-card:hover { border-color: #388bfd; }
+  .lead-card .council-tag {
+    display: inline-block;
+    background: #1c2d3f;
+    color: #79c0ff;
+    border: 1px solid #1f6feb;
+    border-radius: 4px;
+    font-size: 0.7rem;
+    font-weight: 600;
+    padding: 2px 7px;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    margin-right: 6px;
+  }
+  .lead-card .ref {
+    font-family: 'DM Mono', monospace;
+    font-size: 0.85rem;
+    color: #8b949e;
+  }
+  .lead-card .desc {
+    font-size: 0.95rem;
+    color: #c9d1d9;
+    margin: 0.5rem 0 0.3rem;
+    line-height: 1.5;
+  }
+  .lead-card .meta {
+    font-size: 0.78rem;
+    color: #6e7681;
+    margin-top: 0.4rem;
+  }
+  .lead-card .triggers {
+    display: inline-block;
+    background: #1a2535;
+    color: #58a6ff;
+    border: 1px solid #1f4060;
+    border-radius: 4px;
+    font-size: 0.7rem;
+    padding: 1px 6px;
+    margin: 2px 2px 0 0;
+  }
+  .lead-card .link-btn {
+    display: inline-block;
+    background: #21262d;
+    color: #79c0ff;
+    border: 1px solid #30363d;
+    border-radius: 6px;
+    font-size: 0.75rem;
+    padding: 3px 10px;
+    text-decoration: none;
+    margin-right: 6px;
+    margin-top: 6px;
+  }
+  .lead-card .link-btn:hover { border-color: #388bfd; }
+
+  /* Header */
+  .app-header {
+    padding: 0 0 1.5rem;
+    border-bottom: 1px solid #21262d;
+    margin-bottom: 1.5rem;
+  }
+  .app-header h1 {
+    font-size: 1.6rem;
+    font-weight: 600;
+    color: #f0f6fc;
+    margin: 0;
+  }
+  .app-header p {
+    color: #6e7681;
+    font-size: 0.85rem;
+    margin: 0.3rem 0 0;
+  }
+
+  /* Table */
+  .stDataFrame { border-radius: 10px; overflow: hidden; }
+
+  /* Divider */
+  hr { border-color: #21262d; }
+
+  /* Buttons */
+  .stButton > button {
+    background: #21262d;
+    color: #c9d1d9;
+    border: 1px solid #30363d;
+    border-radius: 6px;
+    font-size: 0.8rem;
+  }
+  .stButton > button:hover {
+    background: #30363d;
+    border-color: #58a6ff;
+    color: #f0f6fc;
+  }
+
+  /* Hide default streamlit branding */
+  #MainMenu { visibility: hidden; }
+  footer    { visibility: hidden; }
+  header    { visibility: hidden; }
+</style>
+""", unsafe_allow_html=True)
+
+# ── CONSTANTS ────────────────────────────────────────────────
+SHEET_ID = "172bpv-b2_nK5ENE1XPk5rWeokvnr1sjHvLBfVzHWh6c"
+SHEET_NAME = "Leads"
+
+COLS = [
+    "Council", "Reference", "Address", "Description", "App Type",
+    "Applicant", "Agent", "Date Received", "Date Decided", "Decision",
+    "Trigger Words", "Score", "Keyword", "Portal Link", "Decision Doc URL",
+    "Date Found", "Mark's Comments",
 ]
-INCLUDE = [
-    "residential development","mixed use","mixed-use",
-    "commercial","industrial","warehouse","logistics",
-    "student accommodation","build to rent","build-to-rent",
-    "new build","residential units","apartments","dwellings",
-    "regeneration","retail development","office","outline",
-    "hybrid","supermarket","hotel","care home","extra care",
-    "demolition and erection","major",
-]
 
-# ════════════════════════════════════════════════════════════
-# SCORING
-# ════════════════════════════════════════════════════════════
-def score_lead(description, status, app_type):
-    score = 0
-    desc  = description.lower()
-    stat  = status.lower()
-    atype = app_type.lower()
-    if any(k in desc for k in ["mixed use","mixed-use","regeneration"]):       score += 35
-    if any(k in desc for k in ["residential","apartments","dwellings"]):       score += 20
-    if any(k in desc for k in ["commercial","office","retail","supermarket"]): score += 25
-    if any(k in desc for k in ["industrial","warehouse","logistics"]):         score += 25
-    if any(k in desc for k in ["student","build to rent","hotel"]):            score += 30
-    if any(k in desc for k in ["care home","extra care"]):                     score += 20
-    units = re.findall(r'(\d+)\s*(?:dwelling|apartment|unit|flat|house|home|bed)', desc)
-    if units:
-        n = max(int(x) for x in units)
-        if   n >= 100: score += 40
-        elif n >= 50:  score += 30
-        elif n >= 20:  score += 20
-        elif n >= 5:   score += 10
-        else:          score -= 15
-    if any(k in stat for k in ["refused","refusal","dismissed"]): score += 45
-    if "appeal"    in stat:                                        score += 40
-    if any(k in stat for k in ["pending","submitted","validated"]): score += 20
-    if "withdrawn" in stat:                                        score += 10
-    if "major"     in atype:                                       score += 30
-    if "outline"   in atype:                                       score += 20
-    return score
-
-def is_qualifying(description, score, min_score, refused_only):
-    desc     = description.lower()
-    is_noise = any(k in desc for k in EXCLUDE)
-    has_sig  = any(k in desc for k in INCLUDE)
-    if is_noise and not has_sig: return False
-    if not has_sig and score < 20: return False
-    if score < min_score: return False
-    if refused_only and "refus" not in desc and "refused" not in desc: return False
-    return True
-
-# ════════════════════════════════════════════════════════════
-# GOOGLE SHEETS
-# ════════════════════════════════════════════════════════════
-def write_to_sheets(leads):
-    try:
-        creds_dict = st.secrets["gcp_service_account"]
-        creds = Credentials.from_service_account_info(
-            creds_dict,
-            scopes=["https://spreadsheets.google.com/feeds",
-                    "https://www.googleapis.com/auth/drive"]
-        )
-        gc = gspread.authorize(creds)
-        ws = gc.open_by_key(st.secrets["gcp"]["sheet_id"]).worksheet("Leads")
-        existing = ws.col_values(2)
-        written = 0
-        for lead in leads:
-            if lead["reference"] in existing:
-                continue
-            ws.append_row([
-                lead["council"], lead["reference"],
-                lead["date_received"], lead["date_validated"],
-                lead["address"], lead["applicant"], lead["agent"],
-                lead["description"], lead["app_type"],
-                lead["status"], lead["decision"],
-                lead["score"], lead["url"],
-                datetime.now().strftime("%Y-%m-%d %H:%M"),
-            ])
-            existing.append(lead["reference"])
-            written += 1
-            time.sleep(0.3)
-        return written
-    except Exception as e:
-        st.warning(f"Sheets write error: {e}")
-        return 0
-
-# ════════════════════════════════════════════════════════════
-# SCRAPER FUNCTIONS (same logic as your Colab script)
-# ════════════════════════════════════════════════════════════
-def parse_page(html):
-    soup  = BeautifulSoup(html, "html.parser")
-    items = []
-    for r in soup.select("li.searchresult"):
-        a = r.select_one("a")
-        if not a: continue
-        desc_el = r.select_one(".proposal") or r.select_one(".description") or r.select_one("p")
-        addr_el = r.select_one(".address") or r.select_one(".addressCol")
-        items.append({
-            "ref":  a.get_text(strip=True),
-            "href": a.get("href",""),
-            "desc": desc_el.get_text(strip=True) if desc_el else "",
-            "addr": addr_el.get_text(strip=True) if addr_el else "",
-        })
-    has_next = bool(
-        soup.find("a", string=re.compile(r"Next", re.I)) or
-        soup.find("a", href=re.compile(r"page="))
+# ── GOOGLE SHEETS CONNECTION ─────────────────────────────────
+@st.cache_resource(ttl=300)   # refresh every 5 min
+def get_gspread_client():
+    """
+    Connects to Sheets using service account credentials stored in
+    Streamlit secrets (st.secrets["gcp_service_account"]).
+    See SETUP GUIDE below for how to set this up.
+    """
+    scopes = [
+        "https://www.googleapis.com/auth/spreadsheets",
+        "https://www.googleapis.com/auth/drive.readonly",
+    ]
+    creds = Credentials.from_service_account_info(
+        st.secrets["gcp_service_account"],
+        scopes=scopes,
     )
-    return items, has_next
+    return gspread.authorize(creds)
 
-async def get_details(page, detail_url, back_url):
-    d = {}
+@st.cache_data(ttl=300)   # cache data for 5 minutes
+def load_data():
     try:
-        await page.goto(detail_url, wait_until="networkidle", timeout=30000)
-        await asyncio.sleep(2)
-        soup = BeautifulSoup(await page.content(), "html.parser")
-        for row in soup.select("tr"):
-            th = row.find("th"); td = row.find("td")
-            if not th or not td: continue
-            label = th.get_text(strip=True).lower()
-            value = td.get_text(strip=True)
-            if "proposal"    in label:                                                        d["proposal"]       = value
-            elif "address"   in label:                                                        d["address"]        = value
-            elif "status"    in label:                                                        d["status"]         = value
-            elif "received"  in label:                                                        d["date_received"]  = value
-            elif "validated" in label:                                                        d["date_validated"] = value
-            elif "decision"  in label and "level" not in label and "expected" not in label:  d["decision"]       = value
-        further = detail_url.replace("activeTab=summary","activeTab=details")
-        await page.goto(further, wait_until="networkidle", timeout=30000)
-        await asyncio.sleep(1.5)
-        soup2 = BeautifulSoup(await page.content(), "html.parser")
-        for row in soup2.select("tr"):
-            th = row.find("th"); td = row.find("td")
-            if not th or not td: continue
-            label = th.get_text(strip=True).lower()
-            value = td.get_text(strip=True)
-            if "applicant name"   in label and not d.get("applicant"): d["applicant"] = value
-            if "agent"            in label and not d.get("agent"):     d["agent"]     = value
-            if "application type" in label and not d.get("app_type"): d["app_type"]  = value
+        client = get_gspread_client()
+        ws     = client.open_by_key(SHEET_ID).worksheet(SHEET_NAME)
+        rows   = ws.get_all_values()
+        if len(rows) < 2:
+            return pd.DataFrame(columns=COLS)
+        headers = rows[0]
+        df = pd.DataFrame(rows[1:], columns=headers)
+
+        # Clean + type-cast
+        df["Score"] = pd.to_numeric(df["Score"], errors="coerce").fillna(0).astype(int)
+
+        # Parse Date Decided
+        def parse_date(s):
+            for fmt in ["%d/%m/%Y", "%Y-%m-%d", "%d %b %Y",
+                        "%a %d %b %Y", "%d-%m-%Y"]:
+                try: return datetime.strptime(s.strip(), fmt)
+                except: pass
+            return None
+
+        df["_date_decided"] = df["Date Decided"].apply(parse_date)
+
+        # Parse Date Found
+        df["_date_found"] = pd.to_datetime(df["Date Found"], errors="coerce")
+
+        return df
     except Exception as e:
-        pass
+        st.error(f"❌ Could not load data: {e}")
+        return pd.DataFrame(columns=COLS)
+
+def save_comment(reference, comment):
     try:
-        await page.goto(back_url, wait_until="networkidle", timeout=30000)
-        await asyncio.sleep(2)
-    except:
-        pass
-    return d
+        client = get_gspread_client()
+        ws     = client.open_by_key(SHEET_ID).worksheet(SHEET_NAME)
+        refs   = ws.col_values(2)  # Column B = Reference
+        if reference in refs:
+            row_idx = refs.index(reference) + 1
+            ws.update_cell(row_idx, 17, comment)  # Column Q = Mark's Comments
+            st.cache_data.clear()
+            return True
+    except Exception as e:
+        st.error(f"❌ Could not save: {e}")
+    return False
 
-async def process_html_leads(page, html, label, week_text, back_url, min_score, refused_only, council_name):
-    leads = []
-    items, _ = parse_page(html)
-    for item in items:
-        qs = score_lead(item["desc"], label, "")
-        q  = is_qualifying(item["desc"], qs, min_score, refused_only)
-        if not q:
-            continue
-        href = item["href"]
-        kv   = href.split("keyVal=")[-1].split("&")[0] if "keyVal=" in href else ""
-        base = COUNCILS[council_name]
-        det  = f"{base}/applicationDetails.do?activeTab=summary&keyVal={kv}" if kv else f"{base}/{href.lstrip('/')}"
-        await asyncio.sleep(2)
-        details     = await get_details(page, det, back_url)
-        fd          = details.get("proposal",  item["desc"])
-        fs          = details.get("status",    label)
-        ft          = details.get("app_type",  "")
-        final_score = score_lead(fd, fs, ft)
-        if not is_qualifying(fd, final_score, min_score, refused_only):
-            continue
-        leads.append({
-            "council": council_name, "reference": item["ref"],
-            "date_received": details.get("date_received",""),
-            "date_validated": details.get("date_validated", week_text),
-            "address": details.get("address", item["addr"]),
-            "applicant": details.get("applicant",""), "agent": details.get("agent",""),
-            "description": fd, "app_type": ft, "status": fs,
-            "decision": details.get("decision",""), "score": final_score, "url": det,
-        })
-    return leads
+# ── SCORE BADGE HTML ─────────────────────────────────────────
+def score_badge(score):
+    cls = "score-high" if score >= 75 else "score-mid" if score >= 55 else "score-low"
+    return f'<span class="score-badge {cls}">{score}</span>'
 
-async def scrape_council(council_name, weeks_back, min_score, refused_only, status_container):
-    base_url = COUNCILS[council_name]
-    all_leads = []
+# ── MAIN APP ─────────────────────────────────────────────────
+def main():
+    # Header
+    st.markdown("""
+    <div class="app-header">
+      <h1>🏗️ MAPlanning Retail Lead Tracker</h1>
+      <p>Refused retail planning applications with sequential test / retail impact grounds</p>
+    </div>
+    """, unsafe_allow_html=True)
 
-    async with async_playwright() as p:
-        # Get week list
-        browser = await p.chromium.launch(
-            headless=True,
-            args=["--no-sandbox","--disable-setuid-sandbox","--disable-dev-shm-usage"]
-        )
-        tmp = await browser.new_page()
-        await tmp.goto(f"{base_url}/search.do?action=weeklyList",
-                       wait_until="networkidle", timeout=60000)
-        await asyncio.sleep(2)
-        weeks = await tmp.eval_on_selector(
-            'select[name="week"]',
-            'el => Array.from(el.options).map(o=>({value:o.value,text:o.text.trim()}))'
-        )
-        weeks = [w for w in weeks if w["value"].strip()][:weeks_back]
-        await browser.close()
+    # Load data
+    with st.spinner("Loading leads from Google Sheets..."):
+        df = load_data()
 
-        for i, week in enumerate(weeks):
-            status_container.info(f"🔍 {council_name} — Week {i+1}/{len(weeks)}: {week['text']}")
+    if df.empty:
+        st.warning("No leads found in the sheet yet. Run the Colab scraper first.")
+        return
 
-            browser = await p.chromium.launch(
-                headless=True,
-                args=["--no-sandbox","--disable-setuid-sandbox",
-                      "--disable-dev-shm-usage",
-                      "--disable-blink-features=AutomationControlled"]
+    # ── SIDEBAR FILTERS ──────────────────────────────────────
+    with st.sidebar:
+        st.markdown("### 🔍 Filters")
+        st.markdown("---")
+
+        # Date range
+        st.markdown("**Decision Date Range**")
+        valid_dates = df["_date_decided"].dropna()
+        if not valid_dates.empty:
+            min_date = valid_dates.min().date()
+            max_date = valid_dates.max().date()
+            default_from = max(min_date, (datetime.now() - timedelta(weeks=12)).date())
+            col1, col2 = st.columns(2)
+            with col1:
+                date_from = st.date_input("From", value=default_from,
+                                          min_value=min_date, max_value=max_date, label_visibility="collapsed")
+            with col2:
+                date_to   = st.date_input("To",   value=max_date,
+                                          min_value=min_date, max_value=max_date, label_visibility="collapsed")
+            st.caption(f"{date_from.strftime('%d %b %Y')} → {date_to.strftime('%d %b %Y')}")
+        else:
+            date_from = date_to = None
+
+        st.markdown("---")
+
+        # Score range
+        st.markdown("**Min Score**")
+        min_score = st.slider("", 0, 100, 50, 5, label_visibility="collapsed")
+
+        st.markdown("---")
+
+        # Council filter
+        councils = sorted(df["Council"].dropna().unique().tolist())
+        st.markdown("**Councils**")
+        selected_councils = st.multiselect("", councils, default=[],
+                                           placeholder="All councils",
+                                           label_visibility="collapsed")
+
+        st.markdown("---")
+
+        # Keyword filter
+        keywords = sorted(df["Keyword"].dropna().unique().tolist())
+        st.markdown("**Keywords**")
+        selected_keywords = st.multiselect("", keywords, default=[],
+                                           placeholder="All keywords",
+                                           label_visibility="collapsed")
+
+        st.markdown("---")
+
+        # Trigger word filter
+        all_triggers = set()
+        for t in df["Trigger Words"].dropna():
+            for w in t.split(","):
+                w = w.strip()
+                if w: all_triggers.add(w)
+        all_triggers = sorted(all_triggers)
+        st.markdown("**Trigger Words**")
+        selected_triggers = st.multiselect("", all_triggers, default=[],
+                                           placeholder="Any trigger",
+                                           label_visibility="collapsed")
+
+        st.markdown("---")
+
+        # Sort
+        st.markdown("**Sort By**")
+        sort_by = st.selectbox("", ["Score (high→low)", "Date Decided (newest)", "Council A→Z"],
+                               label_visibility="collapsed")
+
+        st.markdown("---")
+
+        # View mode
+        st.markdown("**View Mode**")
+        view_mode = st.radio("", ["Cards", "Table"], horizontal=True,
+                             label_visibility="collapsed")
+
+        st.markdown("---")
+        if st.button("🔄 Refresh data"):
+            st.cache_data.clear()
+            st.rerun()
+        st.caption("Data refreshes every 5 min automatically")
+
+    # ── APPLY FILTERS ────────────────────────────────────────
+    filtered = df.copy()
+
+    if date_from and date_to and not valid_dates.empty:
+        dt_from = datetime.combine(date_from, datetime.min.time())
+        dt_to   = datetime.combine(date_to,   datetime.max.time())
+        filtered = filtered[
+            filtered["_date_decided"].apply(
+                lambda d: d is not None and dt_from <= d <= dt_to
             )
-            context = await browser.new_context(
-                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36",
-                viewport={"width": 1280, "height": 800},
-            )
-            page = await context.new_page()
-            await page.add_init_script(
-                "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
-            )
+        ]
 
-            # Validated
-            try:
-                await page.goto(f"{base_url}/search.do?action=weeklyList",
-                                wait_until="networkidle", timeout=60000)
-                await asyncio.sleep(3)
-                await page.check('input[name="dateType"][value="DC_Validated"]')
-                await asyncio.sleep(0.5)
-                await page.select_option('select[name="week"]', value=week["value"])
-                await asyncio.sleep(1)
-                await page.click('input[type="submit"][value="Search"]')
-                landed = False
-                for _ in range(30):
-                    await asyncio.sleep(1)
-                    if "weeklyListResults" in page.url or "pagedSearchResults" in page.url:
-                        landed = True; break
-                if landed:
-                    page_num = 1
-                    while True:
-                        await page.wait_for_load_state("networkidle")
-                        html = await page.content()
-                        items_on_page, has_next = parse_page(html)
-                        if not items_on_page: break
-                        back_url = page.url
-                        batch = await process_html_leads(page, html, "Validated", week["text"], back_url, min_score, refused_only, council_name)
-                        all_leads.extend(batch)
-                        if not has_next: break
-                        page_num += 1
-                        await page.goto(f"{base_url}/pagedSearchResults.do?action=page&searchCriteria.page={page_num}", wait_until="networkidle", timeout=30000)
-                        await asyncio.sleep(2)
-            except Exception as e:
-                status_container.warning(f"Validated error: {e}")
+    filtered = filtered[filtered["Score"] >= min_score]
 
-            # Decided via browser fetch()
-            try:
-                await page.goto(f"{base_url}/search.do?action=weeklyList",
-                                wait_until="networkidle", timeout=30000)
-                await asyncio.sleep(2)
-                csrf = await page.eval_on_selector('input[name="_csrf"]', 'el => el.value')
-                week_val = week["value"].replace("'", "\\'")
-                decided_html = await page.evaluate(f"""
-                    async () => {{
-                        const params = new URLSearchParams();
-                        params.append('_csrf', '{csrf}');
-                        params.append('dateType', 'DC_Decided');
-                        params.append('week', '{week_val}');
-                        params.append('searchType', 'Application');
-                        const resp = await fetch('{base_url}/weeklyListResults.do?action=firstPage', {{
-                            method: 'POST',
-                            headers: {{'Content-Type': 'application/x-www-form-urlencoded',
-                                      'Referer': '{base_url}/search.do?action=weeklyList'}},
-                            body: params.toString(),
-                            credentials: 'include'
-                        }});
-                        return await resp.text();
-                    }}
-                """)
-                if decided_html and "searchresult" in decided_html.lower():
-                    results_url = f"{base_url}/weeklyListResults.do?action=firstPage"
-                    batch = await process_html_leads(page, decided_html, "Decided", week["text"], results_url, min_score, refused_only, council_name)
-                    all_leads.extend(batch)
-                    _, has_next = parse_page(decided_html)
-                    pnum = 2
-                    while has_next:
-                        next_url = f"{base_url}/pagedSearchResults.do?action=page&searchCriteria.page={pnum}"
-                        next_html = await page.evaluate(f"""
-                            async () => {{
-                                const resp = await fetch('{next_url}', {{credentials: 'include'}});
-                                return await resp.text();
-                            }}
-                        """)
-                        if not next_html or "searchresult" not in next_html.lower(): break
-                        more = await process_html_leads(page, next_html, "Decided", week["text"], next_url, min_score, refused_only, council_name)
-                        all_leads.extend(more)
-                        _, has_next = parse_page(next_html)
-                        pnum += 1
-                        await asyncio.sleep(2)
-            except Exception as e:
-                status_container.warning(f"Decided error: {e}")
+    if selected_councils:
+        filtered = filtered[filtered["Council"].isin(selected_councils)]
 
-            await browser.close()
-            await asyncio.sleep(5)
+    if selected_keywords:
+        filtered = filtered[filtered["Keyword"].isin(selected_keywords)]
 
-    return all_leads
+    if selected_triggers:
+        def has_trigger(t):
+            if not t: return False
+            parts = [x.strip() for x in t.split(",")]
+            return any(sel in parts for sel in selected_triggers)
+        filtered = filtered[filtered["Trigger Words"].apply(has_trigger)]
 
-# ════════════════════════════════════════════════════════════
-# UI
-# ════════════════════════════════════════════════════════════
-st.title("🏗️ MAPlanning Lead Engine")
-st.caption("Automated qualified lead generation for Urban Planning consultancy")
-st.divider()
+    # Sort
+    if sort_by == "Score (high→low)":
+        filtered = filtered.sort_values("Score", ascending=False)
+    elif sort_by == "Date Decided (newest)":
+        filtered = filtered.sort_values("_date_decided", ascending=False, na_position="last")
+    else:
+        filtered = filtered.sort_values("Council")
 
-# Sidebar
-with st.sidebar:
-    st.header("⚙️ Search Settings")
+    filtered = filtered.reset_index(drop=True)
 
-    selected_councils = st.multiselect(
-        "Active councils:",
-        options=list(COUNCILS.keys()),
-        default=list(COUNCILS.keys()),
-    )
-
-    unavailable = ["Leeds","Bristol","Birmingham","Cardiff","Liverpool","Sheffield"]
-    with st.expander("❌ Unavailable Councils (coming soon)"):
-        for c in unavailable:
-            st.caption(f"• {c}")
-
-    weeks_back = st.slider("Weeks to look back:", 1, 12, 4)
-    min_score  = st.slider("Minimum score:", 1, 80, 20)
-    refused_only = st.checkbox("🚫 Refused applications only", value=False)
-
-    avg_fee = 2000
-    target  = len(selected_councils) * weeks_back * 2
-    st.info(f"**Target: ~{target} leads/month**\nAvg Fee: £{avg_fee:,}")
-
-    search_btn = st.button("🔍 Search for Leads", type="primary", use_container_width=True)
-
-# Main area
-if search_btn:
-    if not selected_councils:
-        st.error("Select at least one council.")
-        st.stop()
-
-    status_box  = st.empty()
-    progress    = st.progress(0)
-    all_results = []
-
-    for idx, council in enumerate(selected_councils):
-        status_box.info(f"🔍 Scraping {council}...")
-        progress.progress((idx) / len(selected_councils))
-
-        try:
-            loop    = asyncio.new_event_loop()
-            leads   = loop.run_until_complete(
-                scrape_council(council, weeks_back, min_score, refused_only, status_box)
-            )
-            loop.close()
-            all_results.extend(leads)
-        except Exception as e:
-            st.error(f"Error scraping {council}: {e}")
-
-    progress.progress(1.0)
-    all_results.sort(key=lambda x: x["score"], reverse=True)
-
-    # Write to Sheets
-    try:
-        written = write_to_sheets(all_results)
-        status_box.success(f"✅ Done — {len(all_results)} leads found, {written} new rows added to Google Sheets")
-    except:
-        status_box.success(f"✅ Done — {len(all_results)} leads found")
-
-    # Display metrics
-    high   = [l for l in all_results if l["score"] >= 60]
-    medium = [l for l in all_results if 30 <= l["score"] < 60]
-    avg_s  = round(sum(l["score"] for l in all_results) / len(all_results), 1) if all_results else 0
+    # ── METRICS ROW ──────────────────────────────────────────
+    total_all    = len(df)
+    total_shown  = len(filtered)
+    avg_score    = int(filtered["Score"].mean()) if total_shown else 0
+    top_councils = filtered["Council"].value_counts().head(3).index.tolist()
+    top_str      = ", ".join(top_councils) if top_councils else "—"
 
     c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Total Leads",  len(all_results))
-    c2.metric("A-Priority",   len(high))
-    c3.metric("B-Priority",   len(medium))
-    c4.metric("Avg Score",    avg_s)
+    c1.metric("Total Leads", total_all)
+    c2.metric("Showing", total_shown, delta=f"{total_shown - total_all} vs total" if total_shown != total_all else None)
+    c3.metric("Avg Score", f"{avg_score}/100")
+    c4.metric("Top Councils", top_str)
 
-    st.divider()
+    st.markdown("---")
 
-    # Lead cards
-    for i, lead in enumerate(all_results):
-        score = lead["score"]
-        if score >= 60:
-            badge = "🟢 A — HIGH PRIORITY"
-            color = "#d4edda"
-        elif score >= 30:
-            badge = "🟡 B — MEDIUM PRIORITY"
-            color = "#fff3cd"
-        else:
-            badge = "⚪ C — LOW PRIORITY"
-            color = "#f8f9fa"
+    if total_shown == 0:
+        st.info("No leads match your filters. Try widening the date range or lowering the score threshold.")
+        return
 
-        with st.container():
+    # ── CARD VIEW ────────────────────────────────────────────
+    if view_mode == "Cards":
+        st.markdown(f"**{total_shown} lead{'s' if total_shown != 1 else ''}**")
+
+        for _, row in filtered.iterrows():
+            triggers_html = "".join(
+                f'<span class="triggers">{t.strip()}</span>'
+                for t in str(row["Trigger Words"]).split(",") if t.strip()
+            )
+            portal_btn = (f'<a class="link-btn" href="{row["Portal Link"]}" target="_blank">🔗 Portal</a>'
+                          if row.get("Portal Link") else "")
+            doc_btn    = (f'<a class="link-btn" href="{row["Decision Doc URL"]}" target="_blank">📄 Decision PDF</a>'
+                          if row.get("Decision Doc URL") else "")
+            date_str = row["Date Decided"] or "—"
+            addr_str = row["Address"][:80] + "..." if len(str(row["Address"])) > 80 else row["Address"]
+
             st.markdown(f"""
-            <div style="background:{color};padding:16px;border-radius:8px;margin-bottom:12px;border-left:4px solid {'#28a745' if score>=60 else '#ffc107' if score>=30 else '#6c757d'}">
-                <h4>{i+1}. {badge} (Score: {score})</h4>
-                <p><b>Address:</b> {lead['address']} &nbsp;|&nbsp; <b>Council:</b> {lead['council']}</p>
-                <p><b>Applicant:</b> {lead['applicant'] or '—'} &nbsp;|&nbsp; <b>Agent:</b> {lead['agent'] or '—'}</p>
-                <p><b>Status:</b> {lead['status']} &nbsp;|&nbsp; <b>Type:</b> {lead['app_type'] or '—'}</p>
-                <p><b>Description:</b> {lead['description'][:200]}{'...' if len(lead['description'])>200 else ''}</p>
-                <p><b>Ref:</b> {lead['reference']} &nbsp;|&nbsp; <b>Validated:</b> {lead['date_validated']}</p>
+            <div class="lead-card">
+              <div>
+                <span class="council-tag">{row["Council"]}</span>
+                <span class="ref">{row["Reference"]}</span>
+                {score_badge(int(row["Score"]))}
+              </div>
+              <div class="desc">{row["Description"][:200]}</div>
+              <div class="meta">
+                📍 {addr_str}&nbsp;&nbsp;
+                📅 Decided: {date_str}&nbsp;&nbsp;
+                👤 {row["Applicant"] or "—"}
+              </div>
+              <div style="margin-top:0.5rem">{triggers_html}</div>
+              <div>{portal_btn}{doc_btn}</div>
             </div>
             """, unsafe_allow_html=True)
 
-            col1, col2 = st.columns([1, 4])
-            with col1:
-                st.link_button("🔗 View Application", lead["url"])
+            # Comment box (inline, collapsed by default)
+            with st.expander(f"💬 Mark's comment — {row['Reference']}"):
+                existing = str(row["Mark's Comments"]) if row.get("Mark's Comments") else ""
+                new_comment = st.text_area("Comment", value=existing,
+                                           key=f"comment_{row['Reference']}",
+                                           label_visibility="collapsed",
+                                           height=80)
+                if st.button("Save", key=f"save_{row['Reference']}"):
+                    if save_comment(row["Reference"], new_comment):
+                        st.success("✅ Saved")
 
-else:
-    st.info("👈 Configure your search settings and click **Search for Leads** to begin.")
-    st.markdown("""
-    **How it works:**
-    - Select which councils to monitor
-    - Set how many weeks back to search
-    - Set minimum lead score threshold
-    - Optionally filter to refused applications only (appeal opportunities for Mark)
-    - Results are automatically saved to Google Sheets
-    """)
-```
+    # ── TABLE VIEW ───────────────────────────────────────────
+    else:
+        display_cols = ["Score", "Council", "Reference", "Address",
+                        "Description", "Date Decided", "Trigger Words",
+                        "Applicant", "Keyword", "Mark's Comments"]
+        show_df = filtered[[c for c in display_cols if c in filtered.columns]].copy()
 
----
+        # Truncate long text
+        for col in ["Description", "Address", "Trigger Words"]:
+            if col in show_df.columns:
+                show_df[col] = show_df[col].apply(
+                    lambda x: str(x)[:80] + "…" if len(str(x)) > 80 else x
+                )
 
-## Deploying It — Step by Step
+        st.dataframe(
+            show_df,
+            use_container_width=True,
+            height=600,
+            column_config={
+                "Score": st.column_config.ProgressColumn(
+                    "Score", min_value=0, max_value=100, format="%d"
+                ),
+                "Council": st.column_config.TextColumn("Council", width="small"),
+                "Reference": st.column_config.TextColumn("Ref", width="medium"),
+            },
+            hide_index=True,
+        )
 
-**Step 1:** Go to `github.com` → New repo → `maplanning-leads` → Public
+        # CSV download
+        csv = filtered.drop(columns=["_date_decided","_date_found"], errors="ignore").to_csv(index=False)
+        st.download_button(
+            "⬇️ Download CSV",
+            csv,
+            f"maplanning_leads_{datetime.now().strftime('%Y%m%d')}.csv",
+            "text/csv",
+        )
 
-**Step 2:** Create `requirements.txt` in the repo with:
-```
-playwright==1.41.0
-beautifulsoup4
-gspread
-google-auth
-streamlit
+if __name__ == "__main__":
+    main()
