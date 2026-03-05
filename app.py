@@ -231,6 +231,8 @@ EXPECTED   = [
 ]
 
 # ── DATA ─────────────────────────────────────────────────────
+import time as _time
+
 @st.cache_resource(ttl=300)
 def get_client():
     creds = Credentials.from_service_account_info(
@@ -242,11 +244,27 @@ def get_client():
     )
     return gspread.authorize(creds)
 
+def _retry(fn, retries=5, base_delay=8):
+    """Retry a Sheets API call with exponential backoff on transient errors."""
+    for attempt in range(retries):
+        try:
+            return fn()
+        except Exception as e:
+            msg = str(e)
+            transient = any(c in msg for c in
+                ["500", "503", "quota", "rate", "UNAVAILABLE", "internal", "temporarily"])
+            if transient and attempt < retries - 1:
+                wait = base_delay * (2 ** attempt)   # 8, 16, 32, 64s
+                _time.sleep(wait)
+            else:
+                raise
+
 @st.cache_data(ttl=300)
 def load_data():
     try:
-        ws   = get_client().open_by_key(SHEET_ID).worksheet(SHEET_NAME)
-        rows = ws.get_all_values()
+        ws   = _retry(lambda: get_client().open_by_key(SHEET_ID).worksheet(SHEET_NAME))
+        rows = _retry(lambda: ws.get_all_values())
+
         if len(rows) < 2:
             return pd.DataFrame(columns=EXPECTED)
 
@@ -258,17 +276,14 @@ def load_data():
             h = h.strip()
             if h in seen:
                 seen[h] += 1
-                headers.append(f"__dup_{h}_{seen[h]}")   # rename duplicates
+                headers.append(f"__dup_{h}_{seen[h]}")
             else:
                 seen[h] = 0
                 headers.append(h)
 
         df = pd.DataFrame(rows[1:], columns=headers)
-
-        # Drop renamed duplicate columns — keep only first occurrence
         df = df[[c for c in df.columns if not c.startswith("__dup_")]]
 
-        # Ensure all expected columns present
         for col in EXPECTED:
             if col not in df.columns:
                 df[col] = ""
@@ -286,15 +301,15 @@ def load_data():
         return df
 
     except Exception as e:
-        st.error(f"❌ Could not load data: {e}")
+        st.error(f"❌ Could not load data from Sheets: {e}\n\nGoogle's API may be temporarily unavailable — wait 30s and refresh.")
         return pd.DataFrame(columns=EXPECTED)
 
 def save_comment(ref, comment):
     try:
-        ws   = get_client().open_by_key(SHEET_ID).worksheet(SHEET_NAME)
-        refs = ws.col_values(2)
+        ws   = _retry(lambda: get_client().open_by_key(SHEET_ID).worksheet(SHEET_NAME))
+        refs = _retry(lambda: ws.col_values(2))
         if ref in refs:
-            ws.update_cell(refs.index(ref) + 1, 17, comment)
+            _retry(lambda: ws.update_cell(refs.index(ref) + 1, 17, comment))
             st.cache_data.clear()
             return True
     except Exception as e:
